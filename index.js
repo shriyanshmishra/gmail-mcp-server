@@ -20,73 +20,81 @@ if (process.env.GMAIL_REFRESH_TOKEN) {
   });
 }
 
-// ── MCP Server Instance ───────────────────────────────────
-const server = new McpServer({
-  name: 'gmail-mcp-server',
-  version: '1.0.0',
-});
+// ── Tool registration function ────────────────────────────
+function registerTools(server) {
 
-// ── Tool 1: gmail_list_messages ───────────────────────────
-server.tool(
-  'gmail_list_messages',
-  'List recent unread messages from Gmail inbox.',
-  { maxResults: z.number().optional().default(10) },
-  async ({ maxResults }) => {
-    const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
-    const res = await gmail.users.messages.list({
-      userId: 'me', q: 'is:unread', maxResults,
-    });
-    return { content: [{ type: 'text', text: JSON.stringify(res.data.messages || []) }] };
-  }
-);
-
-// ── Tool 2: gmail_get_message ─────────────────────────────
-server.tool(
-  'gmail_get_message',
-  'Retrieve the full content of a Gmail message by ID.',
-  { messageId: z.string() },
-  async ({ messageId }) => {
-    const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
-    const msg = await gmail.users.messages.get({
-      userId: 'me', id: messageId, format: 'full',
-    });
-    const parts = msg.data.payload?.parts || [];
-    let body = '';
-    for (const part of parts) {
-      if (part.mimeType === 'text/plain' && part.body?.data) {
-        body = Buffer.from(part.body.data, 'base64').toString('utf-8');
-        break;
-      }
+  server.tool(
+    'gmail_list_messages',
+    'List recent unread messages from Gmail inbox.',
+    { maxResults: z.number().optional().default(10) },
+    async ({ maxResults }) => {
+      const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
+      const res = await gmail.users.messages.list({
+        userId: 'me', q: 'is:unread', maxResults,
+      });
+      return { content: [{ type: 'text', text: JSON.stringify(res.data.messages || []) }] };
     }
-    const headers = msg.data.payload?.headers || [];
-    const from    = headers.find(h => h.name === 'From')?.value || '';
-    const subject = headers.find(h => h.name === 'Subject')?.value || '';
-    const date    = headers.find(h => h.name === 'Date')?.value || '';
-    return { content: [{ type: 'text', text: JSON.stringify({ from, subject, date, body }) }] };
-  }
-);
+  );
 
-// ── Tool 3: gmail_search ──────────────────────────────────
-server.tool(
-  'gmail_search',
-  'Search Gmail messages by query string (Gmail search syntax).',
-  { query: z.string(), maxResults: z.number().optional().default(10) },
-  async ({ query, maxResults }) => {
-    const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
-    const res = await gmail.users.messages.list({
-      userId: 'me', q: query, maxResults,
-    });
-    return { content: [{ type: 'text', text: JSON.stringify(res.data.messages || []) }] };
-  }
-);
+  server.tool(
+    'gmail_get_message',
+    'Retrieve the full content of a Gmail message by ID.',
+    { messageId: z.string() },
+    async ({ messageId }) => {
+      const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
+      const msg = await gmail.users.messages.get({
+        userId: 'me', id: messageId, format: 'full',
+      });
+      const parts = msg.data.payload?.parts || [];
+      let body = '';
+      for (const part of parts) {
+        if (part.mimeType === 'text/plain' && part.body?.data) {
+          body = Buffer.from(part.body.data, 'base64').toString('utf-8');
+          break;
+        }
+      }
+      const headers = msg.data.payload?.headers || [];
+      const from    = headers.find(h => h.name === 'From')?.value || '';
+      const subject = headers.find(h => h.name === 'Subject')?.value || '';
+      const date    = headers.find(h => h.name === 'Date')?.value || '';
+      return { content: [{ type: 'text', text: JSON.stringify({ from, subject, date, body }) }] };
+    }
+  );
+
+  server.tool(
+    'gmail_search',
+    'Search Gmail messages by query string (Gmail search syntax).',
+    { query: z.string(), maxResults: z.number().optional().default(10) },
+    async ({ query, maxResults }) => {
+      const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
+      const res = await gmail.users.messages.list({
+        userId: 'me', q: query, maxResults,
+      });
+      return { content: [{ type: 'text', text: JSON.stringify(res.data.messages || []) }] };
+    }
+  );
+}
 
 // ── Streamable HTTP Endpoint (/mcp) ───────────────────────
 app.all('/mcp', async (req, res) => {
-  const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: undefined
-  });
-  await server.connect(transport);
-  await transport.handleRequest(req, res, req.body);
+  try {
+    const server = new McpServer({
+      name: 'gmail-mcp-server',
+      version: '1.0.0',
+    });
+
+    registerTools(server);
+
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined,
+    });
+
+    await server.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+  } catch (error) {
+    console.error('MCP handler error:', error);
+    res.status(500).json({ error: error.message });
+  }
 });
 
 // ── OAuth Callback ────────────────────────────────────────
