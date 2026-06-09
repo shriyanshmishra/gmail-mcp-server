@@ -188,7 +188,7 @@ app.post('/gmail-webhook', async (req, res) => {
     const gmail = getGmail();
     const history = await gmail.users.history.list({
       userId: 'me',
-      startHistoryId: historyId,
+      startHistoryId: String(parseInt(historyId) - 1),
       historyTypes: ['messageAdded'],
     });
 
