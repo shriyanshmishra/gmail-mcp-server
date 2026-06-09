@@ -163,9 +163,11 @@ async function isSpamOrUnwanted(messageId) {
   }
 }
 
+// ── Store last known historyId ────────────────────────────
+let lastHistoryId = null;
+
 // ── Gmail Push Webhook ────────────────────────────────────
 app.post('/gmail-webhook', async (req, res) => {
-  // Acknowledge immediately — Pub/Sub requires response within deadline
   res.status(200).send('OK');
 
   try {
@@ -175,24 +177,42 @@ app.post('/gmail-webhook', async (req, res) => {
       return;
     }
 
-    // Decode Pub/Sub message
     const decoded = JSON.parse(
       Buffer.from(message.data, 'base64').toString('utf-8')
     );
     console.log('Gmail push received:', JSON.stringify(decoded));
 
-    const historyId = decoded.historyId;
-    if (!historyId) return;
+    const newHistoryId = decoded.historyId;
+    if (!newHistoryId) return;
 
-    // Fetch new messages since this historyId
+    // First push — just store historyId, nothing to compare yet
+    if (!lastHistoryId) {
+      console.log('First push — storing historyId:', newHistoryId);
+      lastHistoryId = newHistoryId;
+      return;
+    }
+
+    // Fetch history since LAST known historyId
     const gmail = getGmail();
-    const history = await gmail.users.history.list({
-      userId: 'me',
-      startHistoryId: String(parseInt(historyId) - 1),
-      historyTypes: ['messageAdded'],
-    });
+    let history;
+    try {
+      history = await gmail.users.history.list({
+        userId: 'me',
+        startHistoryId: lastHistoryId,
+        historyTypes: ['messageAdded'],
+      });
+    } catch (err) {
+      console.log('History fetch failed, updating historyId:', err.message);
+      lastHistoryId = newHistoryId;
+      return;
+    }
+
+    // Update stored historyId
+    lastHistoryId = newHistoryId;
 
     const records = history.data.history || [];
+    console.log('History records found:', records.length);
+
     if (records.length === 0) {
       console.log('No new messages in history');
       return;
@@ -206,14 +226,14 @@ app.post('/gmail-webhook', async (req, res) => {
         const messageId = added.message.id;
         console.log('Processing message:', messageId);
 
-        // Step 1 — Spam check using Gmail labels
+        // Spam check
         const spam = await isSpamOrUnwanted(messageId);
         if (spam) {
-          console.log('Skipped message:', messageId);
+          console.log('Skipped — spam or unwanted:', messageId);
           continue;
         }
 
-        // Step 2 — Get full email content
+        // Get full email
         const msg = await gmail.users.messages.get({
           userId: 'me',
           id: messageId,
@@ -233,13 +253,13 @@ app.post('/gmail-webhook', async (req, res) => {
         console.log('Email from:', emailData.from);
         console.log('Subject:', emailData.subject);
 
-        // Step 3 — Send to Agentforce for AI processing and lead creation
+        // Trigger Agentforce
         await triggerAgentforce(emailData);
       }
     }
 
   } catch (error) {
-    console.error('Webhook processing error:', error.message);
+    console.error('Webhook error:', error.message);
   }
 });
 
