@@ -369,16 +369,6 @@ app.get('/auth', (req, res) => {
 
 app.get('/', (req, res) => res.json({ status: 'Gmail MCP Server running', version: '1.0.0' }));
 
-// ── Start Server ──────────────────────────────────────────
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, async () => {
-  console.log(`Gmail MCP Server running on port ${PORT}`);
-  // Register Gmail watch on startup
-  await registerGmailWatch();
-});
-
-// Auto-renew Gmail watch every 6 days (expires after 7 days)
-setInterval(registerGmailWatch, 6 * 24 * 60 * 60 * 1000);
 
 // ── Start Server ──────────────────────────────────────────
 const PORT = process.env.PORT || 8080;
