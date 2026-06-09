@@ -379,3 +379,25 @@ app.listen(PORT, async () => {
 
 // Auto-renew Gmail watch every 6 days (expires after 7 days)
 setInterval(registerGmailWatch, 6 * 24 * 60 * 60 * 1000);
+
+// ── Start Server ──────────────────────────────────────────
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, async () => {
+  console.log(`Gmail MCP Server running on port ${PORT}`);
+  // Register Gmail watch on startup
+  await registerGmailWatch();
+});
+
+// Auto-renew Gmail watch every 6 days (expires after 7 days)
+setInterval(registerGmailWatch, 6 * 24 * 60 * 60 * 1000);
+
+// ── Keep Server Awake (Render free tier) ──────────────────
+const SELF_URL = 'https://gmail-mcp-server-himw.onrender.com/';
+setInterval(async () => {
+  try {
+    await fetch(SELF_URL);
+    console.log('Keep-alive ping sent');
+  } catch (e) {
+    console.error('Keep-alive failed:', e.message);
+  }
+}, 10 * 60 * 1000); // every 10 minutes
