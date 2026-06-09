@@ -90,15 +90,21 @@ If this is a qualifying lead, extract the name, company, phone and create the le
       variables: []
     };
 
-    const res = await fetch(
-      `${process.env.SF_INSTANCE_URL}/services/data/v62.0/einstein/ai-agent/agents/${process.env.SF_AGENT_API_NAME}/sessions`,
+   const res = await fetch(
+  `${process.env.SF_INSTANCE_URL}/services/data/v62.0/einstein/ai-agent/sessions`,
       {
         method: 'POST',
         headers: {
           'Authorization': `Bearer ${token}`,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ externalSessionKey: sessionId, instanceConfig: { endpoint: process.env.SF_INSTANCE_URL } }),
+        body: JSON.stringify({
+          externalSessionKey: sessionId,
+          agentId: process.env.SF_AGENT_API_NAME,
+          instanceConfig: {
+            endpoint: process.env.SF_INSTANCE_URL
+          }
+        }),
       }
     );
 
