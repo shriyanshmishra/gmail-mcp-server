@@ -7,20 +7,18 @@ import { z } from 'zod';
 const app = express();
 app.use(express.json());
 
-// ── OAuth 2.1 Client ──────────────────────────────────────
+// ── OAuth 2.0 Client (Gmail) ─────────────────────────────
 const oauth2Client = new google.auth.OAuth2(
   process.env.GMAIL_CLIENT_ID,
   process.env.GMAIL_CLIENT_SECRET,
   process.env.GMAIL_REDIRECT_URI
 );
-
 if (process.env.GMAIL_REFRESH_TOKEN) {
   oauth2Client.setCredentials({
     refresh_token: process.env.GMAIL_REFRESH_TOKEN
   });
 }
 
-// ── Shared Gmail helper ───────────────────────────────────
 function getGmail() {
   return google.gmail({ version: 'v1', auth: oauth2Client });
 }
@@ -32,26 +30,243 @@ function extractBody(payload) {
       return Buffer.from(part.body.data, 'base64').toString('utf-8');
     }
   }
-  // fallback: check body directly
   if (payload?.body?.data) {
     return Buffer.from(payload.body.data, 'base64').toString('utf-8');
   }
   return '';
 }
 
-// ════════════════════════════════════════════════════════
-// REST ENDPOINTS (for Salesforce External Services)
-// ════════════════════════════════════════════════════════
+// ── Salesforce Auth (Client Credentials Flow) ────────────
+async function getSalesforceToken() {
+  const params = new URLSearchParams({
+    grant_type: 'client_credentials',
+    client_id: process.env.SF_CLIENT_ID,
+    client_secret: process.env.SF_CLIENT_SECRET,
+  });
 
-// GET /list?maxResults=10
+  const res = await fetch(
+    `${process.env.SF_INSTANCE_URL}/services/oauth2/token`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: params,
+    }
+  );
+
+  const data = await res.json();
+  if (!data.access_token) {
+    throw new Error('SF auth failed: ' + JSON.stringify(data));
+  }
+  console.log('Salesforce token obtained successfully.');
+  return data.access_token;
+}
+
+// ── Trigger Agentforce Agent via Einstein API ─────────────
+async function triggerAgentforce(emailData) {
+  try {
+    const token = await getSalesforceToken();
+
+    const sessionId = 'auto-' + Date.now();
+
+    const body = {
+      message: {
+        role: 'user',
+        content: [
+          {
+            type: 'text',
+            text: `A new email has arrived in the Gmail inbox. Please process it and create a Salesforce Lead if it is a genuine sales inquiry. DO NOT create a lead if it looks like spam, newsletter, auto-reply, or out-of-office.
+
+Email details:
+From: ${emailData.from}
+Subject: ${emailData.subject}
+Date: ${emailData.date}
+Body:
+${emailData.body}
+
+If this is a qualifying lead, extract the name, company, phone and create the lead. If it is spam or not a sales inquiry, skip it and explain why.`
+          }
+        ]
+      },
+      variables: []
+    };
+
+    const res = await fetch(
+      `${process.env.SF_INSTANCE_URL}/services/data/v62.0/einstein/ai-agent/agents/${process.env.SF_AGENT_API_NAME}/sessions`,
+      {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ externalSessionKey: sessionId, instanceConfig: { endpoint: process.env.SF_INSTANCE_URL } }),
+      }
+    );
+
+    const sessionData = await res.json();
+    console.log('Agent session created:', JSON.stringify(sessionData));
+
+    if (!sessionData.id) {
+      throw new Error('Failed to create agent session: ' + JSON.stringify(sessionData));
+    }
+
+    // Send message to agent session
+    const msgRes = await fetch(
+      `${process.env.SF_INSTANCE_URL}/services/data/v62.0/einstein/ai-agent/sessions/${sessionData.id}/messages`,
+      {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(body),
+      }
+    );
+
+    const msgData = await msgRes.json();
+    console.log('Agent response:', JSON.stringify(msgData));
+
+  } catch (error) {
+    console.error('Agentforce trigger error:', error.message);
+  }
+}
+
+// ── Spam Check ────────────────────────────────────────────
+async function isSpamOrUnwanted(messageId) {
+  try {
+    const gmail = getGmail();
+    const msg = await gmail.users.messages.get({
+      userId: 'me',
+      id: messageId,
+      format: 'metadata',
+      metadataHeaders: ['From', 'Subject'],
+    });
+
+    const labels = msg.data.labelIds || [];
+    console.log('Message labels:', labels);
+
+    // Skip if Gmail marked as spam or trash
+    if (labels.includes('SPAM') || labels.includes('TRASH')) {
+      console.log('Skipping — Gmail marked as SPAM or TRASH');
+      return true;
+    }
+
+    // Skip if it is not in INBOX
+    if (!labels.includes('INBOX')) {
+      console.log('Skipping — not in INBOX');
+      return true;
+    }
+
+    return false;
+  } catch (error) {
+    console.error('Spam check error:', error.message);
+    return false;
+  }
+}
+
+// ── Gmail Push Webhook ────────────────────────────────────
+app.post('/gmail-webhook', async (req, res) => {
+  // Acknowledge immediately — Pub/Sub requires response within deadline
+  res.status(200).send('OK');
+
+  try {
+    const message = req.body?.message;
+    if (!message?.data) {
+      console.log('No message data received');
+      return;
+    }
+
+    // Decode Pub/Sub message
+    const decoded = JSON.parse(
+      Buffer.from(message.data, 'base64').toString('utf-8')
+    );
+    console.log('Gmail push received:', JSON.stringify(decoded));
+
+    const historyId = decoded.historyId;
+    if (!historyId) return;
+
+    // Fetch new messages since this historyId
+    const gmail = getGmail();
+    const history = await gmail.users.history.list({
+      userId: 'me',
+      startHistoryId: historyId,
+      historyTypes: ['messageAdded'],
+    });
+
+    const records = history.data.history || [];
+    if (records.length === 0) {
+      console.log('No new messages in history');
+      return;
+    }
+
+    // Process each new message
+    for (const record of records) {
+      if (!record.messagesAdded) continue;
+
+      for (const added of record.messagesAdded) {
+        const messageId = added.message.id;
+        console.log('Processing message:', messageId);
+
+        // Step 1 — Spam check using Gmail labels
+        const spam = await isSpamOrUnwanted(messageId);
+        if (spam) {
+          console.log('Skipped message:', messageId);
+          continue;
+        }
+
+        // Step 2 — Get full email content
+        const msg = await gmail.users.messages.get({
+          userId: 'me',
+          id: messageId,
+          format: 'full',
+        });
+
+        const headers = msg.data.payload?.headers || [];
+        const get = name => headers.find(h => h.name === name)?.value || '';
+
+        const emailData = {
+          from: get('From'),
+          subject: get('Subject'),
+          date: get('Date'),
+          body: extractBody(msg.data.payload),
+        };
+
+        console.log('Email from:', emailData.from);
+        console.log('Subject:', emailData.subject);
+
+        // Step 3 — Send to Agentforce for AI processing and lead creation
+        await triggerAgentforce(emailData);
+      }
+    }
+
+  } catch (error) {
+    console.error('Webhook processing error:', error.message);
+  }
+});
+
+// ── Register Gmail Watch ──────────────────────────────────
+async function registerGmailWatch() {
+  try {
+    const gmail = getGmail();
+    const res = await gmail.users.watch({
+      userId: 'me',
+      requestBody: {
+        labelIds: ['INBOX'],
+        topicName: process.env.PUBSUB_TOPIC_NAME,
+      },
+    });
+    console.log('Gmail watch registered successfully');
+    console.log('Expires:', new Date(parseInt(res.data.expiration)).toISOString());
+  } catch (error) {
+    console.error('Gmail watch error:', error.message);
+  }
+}
+
+// ── REST Endpoints (Salesforce External Services) ─────────
 app.get('/list', async (req, res) => {
   try {
     const maxResults = parseInt(req.query.maxResults) || 10;
-    const gmail = getGmail();
-    const result = await gmail.users.messages.list({
-      userId: 'me',
-      q: 'is:unread',
-      maxResults,
+    const result = await getGmail().users.messages.list({
+      userId: 'me', q: 'is:unread', maxResults
     });
     res.json(result.data.messages || []);
   } catch (error) {
@@ -60,44 +275,31 @@ app.get('/list', async (req, res) => {
   }
 });
 
-// GET /get?messageId=xxx
 app.get('/get', async (req, res) => {
   try {
-    const messageId = req.query.messageId;
-    if (!messageId) {
-      return res.status(400).json({ error: 'messageId is required' });
-    }
-    const gmail = getGmail();
-    const msg = await gmail.users.messages.get({
-      userId: 'me',
-      id: messageId,
-      format: 'full',
+    const { messageId } = req.query;
+    if (!messageId) return res.status(400).json({ error: 'messageId required' });
+    const msg = await getGmail().users.messages.get({
+      userId: 'me', id: messageId, format: 'full'
     });
     const headers = msg.data.payload?.headers || [];
-    const from    = headers.find(h => h.name === 'From')?.value || '';
-    const subject = headers.find(h => h.name === 'Subject')?.value || '';
-    const date    = headers.find(h => h.name === 'Date')?.value || '';
-    const body    = extractBody(msg.data.payload);
-    res.json({ from, subject, date, body });
+    const get = name => headers.find(h => h.name === name)?.value || '';
+    res.json({
+      from: get('From'), subject: get('Subject'),
+      date: get('Date'), body: extractBody(msg.data.payload)
+    });
   } catch (error) {
     console.error('/get error:', error.message);
     res.status(500).json({ error: error.message });
   }
 });
 
-// GET /search?q=is:unread&maxResults=10
 app.get('/search', async (req, res) => {
   try {
-    const q = req.query.q;
-    if (!q) {
-      return res.status(400).json({ error: 'q (query) is required' });
-    }
-    const maxResults = parseInt(req.query.maxResults) || 10;
-    const gmail = getGmail();
-    const result = await gmail.users.messages.list({
-      userId: 'me',
-      q,
-      maxResults,
+    const { q, maxResults } = req.query;
+    if (!q) return res.status(400).json({ error: 'q required' });
+    const result = await getGmail().users.messages.list({
+      userId: 'me', q, maxResults: parseInt(maxResults) || 10
     });
     res.json(result.data.messages || []);
   } catch (error) {
@@ -106,51 +308,28 @@ app.get('/search', async (req, res) => {
   }
 });
 
-// ════════════════════════════════════════════════════════
-// MCP ENDPOINT (Streamable HTTP — kept for future use)
-// ════════════════════════════════════════════════════════
-
+// ── MCP Endpoint (kept for future use) ───────────────────
 function registerTools(server) {
-  server.tool(
-    'gmail_list_messages',
-    'List recent unread messages from Gmail inbox.',
+  server.tool('gmail_list_messages', 'List unread Gmail messages.',
     { maxResults: z.number().optional().default(10) },
     async ({ maxResults }) => {
-      const gmail = getGmail();
-      const res = await gmail.users.messages.list({
-        userId: 'me', q: 'is:unread', maxResults,
-      });
+      const res = await getGmail().users.messages.list({ userId: 'me', q: 'is:unread', maxResults });
       return { content: [{ type: 'text', text: JSON.stringify(res.data.messages || []) }] };
     }
   );
-
-  server.tool(
-    'gmail_get_message',
-    'Retrieve the full content of a Gmail message by ID.',
+  server.tool('gmail_get_message', 'Get full email by ID.',
     { messageId: z.string() },
     async ({ messageId }) => {
-      const gmail = getGmail();
-      const msg = await gmail.users.messages.get({
-        userId: 'me', id: messageId, format: 'full',
-      });
+      const msg = await getGmail().users.messages.get({ userId: 'me', id: messageId, format: 'full' });
       const headers = msg.data.payload?.headers || [];
-      const from    = headers.find(h => h.name === 'From')?.value || '';
-      const subject = headers.find(h => h.name === 'Subject')?.value || '';
-      const date    = headers.find(h => h.name === 'Date')?.value || '';
-      const body    = extractBody(msg.data.payload);
-      return { content: [{ type: 'text', text: JSON.stringify({ from, subject, date, body }) }] };
+      const get = name => headers.find(h => h.name === name)?.value || '';
+      return { content: [{ type: 'text', text: JSON.stringify({ from: get('From'), subject: get('Subject'), date: get('Date'), body: extractBody(msg.data.payload) }) }] };
     }
   );
-
-  server.tool(
-    'gmail_search',
-    'Search Gmail messages by query string.',
+  server.tool('gmail_search', 'Search Gmail messages.',
     { query: z.string(), maxResults: z.number().optional().default(10) },
     async ({ query, maxResults }) => {
-      const gmail = getGmail();
-      const res = await gmail.users.messages.list({
-        userId: 'me', q: query, maxResults,
-      });
+      const res = await getGmail().users.messages.list({ userId: 'me', q: query, maxResults });
       return { content: [{ type: 'text', text: JSON.stringify(res.data.messages || []) }] };
     }
   );
@@ -158,51 +337,45 @@ function registerTools(server) {
 
 app.all('/mcp', async (req, res) => {
   try {
-    const server = new McpServer({
-      name: 'gmail-mcp-server',
-      version: '1.0.0',
-    });
+    const server = new McpServer({ name: 'gmail-mcp-server', version: '1.0.0' });
     registerTools(server);
-    const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: undefined,
-    });
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     await server.connect(transport);
     await transport.handleRequest(req, res, req.body);
   } catch (error) {
-    console.error('MCP handler error:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// ════════════════════════════════════════════════════════
-// OAuth Endpoints
-// ════════════════════════════════════════════════════════
-
+// ── OAuth Helper Endpoints ────────────────────────────────
 app.get('/oauth/callback', async (req, res) => {
   try {
-    const { code } = req.query;
-    const { tokens } = await oauth2Client.getToken(String(code));
+    const { tokens } = await oauth2Client.getToken(String(req.query.code));
     oauth2Client.setCredentials(tokens);
     console.log('REFRESH TOKEN:', tokens.refresh_token);
     res.send('OAuth complete. Copy the refresh token from server logs.');
   } catch (error) {
-    res.status(500).send('OAuth error: ' + error.message);
+    res.status(500).send('Error: ' + error.message);
   }
 });
 
 app.get('/auth', (req, res) => {
-  const url = oauth2Client.generateAuthUrl({
+  res.redirect(oauth2Client.generateAuthUrl({
     access_type: 'offline',
     scope: ['https://www.googleapis.com/auth/gmail.readonly'],
     prompt: 'consent',
-  });
-  res.redirect(url);
+  }));
 });
 
-// ── Health check ──────────────────────────────────────────
-app.get('/', (req, res) => {
-  res.json({ status: 'Gmail MCP Server running', version: '1.0.0' });
-});
+app.get('/', (req, res) => res.json({ status: 'Gmail MCP Server running', version: '1.0.0' }));
 
+// ── Start Server ──────────────────────────────────────────
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`Gmail MCP Server running on port ${PORT}`));
+app.listen(PORT, async () => {
+  console.log(`Gmail MCP Server running on port ${PORT}`);
+  // Register Gmail watch on startup
+  await registerGmailWatch();
+});
+
+// Auto-renew Gmail watch every 6 days (expires after 7 days)
+setInterval(registerGmailWatch, 6 * 24 * 60 * 60 * 1000);
