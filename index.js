@@ -69,7 +69,7 @@ async function triggerAgentforce(emailData) {
 
     // Step 1 — Create Agent Session
     const sessionRes = await fetch(
-      `${process.env.SF_INSTANCE_URL}/services/data/v62.0/einstein/ai-agent/sessions`,
+      `${process.env.SF_INSTANCE_URL}/services/data/v66.0/einstein/ai-agent/sessions`,
       {
         method: 'POST',
         headers: {
