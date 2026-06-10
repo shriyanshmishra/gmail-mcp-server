@@ -61,15 +61,33 @@ async function getSalesforceToken() {
   return data.access_token;
 }
 
-// ── Trigger Agentforce Agent via Einstein API ─────────────
+// ── Create Lead via Salesforce Flow directly ──────────────
 async function triggerAgentforce(emailData) {
   try {
     const token = await getSalesforceToken();
-    const sessionId = 'auto-' + Date.now();
 
-    // Step 1 — Create Agent Session
-    const sessionRes = await fetch(
-      `${process.env.SF_INSTANCE_URL}/services/data/v66.0/einstein/ai-agent/sessions`,
+    // Extract name from "John Smith <john@example.com>"
+    const fromMatch = emailData.from.match(/^([^<]+)/);
+    const fullName = fromMatch ? fromMatch[1].trim() : 'Unknown';
+    const nameParts = fullName.split(' ');
+    const firstName = nameParts[0] || 'Unknown';
+    const lastName = nameParts.slice(1).join(' ') || 'Unknown';
+
+    // Extract email address
+    const emailMatch = emailData.from.match(/<([^>]+)>/);
+    const emailAddress = emailMatch ? emailMatch[1] : emailData.from;
+
+    // Extract company from email domain
+    const domainMatch = emailAddress.match(/@([^.]+)/);
+    const company = domainMatch
+      ? domainMatch[1].charAt(0).toUpperCase() + domainMatch[1].slice(1)
+      : 'Unknown Company';
+
+    console.log('Creating lead for:', firstName, lastName, emailAddress, company);
+
+    // Call Salesforce Flow directly via REST API
+    const flowRes = await fetch(
+      `${process.env.SF_INSTANCE_URL}/services/data/v66.0/actions/custom/flow/Create_Sales_Lead_Record`,
       {
         method: 'POST',
         headers: {
@@ -77,87 +95,26 @@ async function triggerAgentforce(emailData) {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          externalSessionKey: sessionId,
-          agentId: process.env.SF_AGENT_API_NAME,
-          instanceConfig: {
-            endpoint: process.env.SF_INSTANCE_URL
-          },
-          streamingCapabilities: {
-            chunkTypes: ['Text']
-          },
-          bypassUser: true
+          inputs: [{
+            leadFirstName: firstName,
+            leadLastName: lastName,
+            leadEmail: emailAddress,
+            leadCompany: company,
+            leadPhone: '',
+            leadDescription: `Auto-created from email. Subject: ${emailData.subject}. Body: ${emailData.body.substring(0, 500)}`
+          }]
         }),
       }
     );
 
-    const sessionText = await sessionRes.text();
-    console.log('Session response status:', sessionRes.status);
-    console.log('Session response:', sessionText);
-
-    let sessionData;
-    try {
-      sessionData = JSON.parse(sessionText);
-    } catch(e) {
-      console.error('Could not parse session response');
-      return;
-    }
-
-    // Check for errors
-    if (Array.isArray(sessionData) && sessionData[0]?.errorCode) {
-      console.error('Session creation error:', sessionData[0].errorCode, sessionData[0].message);
-      return;
-    }
-
-    const sessionIdCreated = sessionData?.id || sessionData?.sessionId;
-    if (!sessionIdCreated) {
-      console.error('No session ID in response:', sessionText);
-      return;
-    }
-
-    console.log('Agent session created successfully:', sessionIdCreated);
-
-    // Step 2 — Send Message to Agent
-    const msgRes = await fetch(
-      `${process.env.SF_INSTANCE_URL}/services/data/v66  .0/einstein/ai-agent/sessions/${sessionIdCreated}/messages`,
-      {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${token}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          message: {
-            role: 'user',
-            content: [
-              {
-                type: 'text',
-                text: `A new email arrived. Process it and create a Salesforce Lead if genuine sales inquiry. Skip if spam, newsletter, auto-reply, or out-of-office.
-
-From: ${emailData.from}
-Subject: ${emailData.subject}
-Date: ${emailData.date}
-Body:
-${emailData.body}
-
-If qualifying lead: extract name, company, phone and create the lead.
-If not a sales inquiry: skip and explain why.`
-              }
-            ]
-          },
-          variables: []
-        }),
-      }
-    );
-
-    const msgText = await msgRes.text();
-    console.log('Message response status:', msgRes.status);
-    console.log('Agent message response:', msgText);
+    const flowText = await flowRes.text();
+    console.log('Flow response status:', flowRes.status);
+    console.log('Flow response:', flowText);
 
   } catch (error) {
-    console.error('Agentforce trigger error:', error.message);
+    console.error('Lead creation error:', error.message);
   }
 }
-
 // ── Spam Check ────────────────────────────────────────────
 async function isSpamOrUnwanted(messageId) {
   try {
