@@ -42,7 +42,6 @@ async function getSalesforceToken() {
     grant_type: 'client_credentials',
     client_id: process.env.SF_CLIENT_ID,
     client_secret: process.env.SF_CLIENT_SECRET,
-    scope: 'api'
   });
 
   const res = await fetch(
