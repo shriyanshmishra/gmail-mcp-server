@@ -87,7 +87,7 @@ async function triggerAgentforce(emailData) {
 
     // Call Salesforce Flow directly via REST API
     const flowRes = await fetch(
-      `${process.env.SF_INSTANCE_URL}/services/data/v66.0/actions/custom/flow/Create_Sales_Lead_Record`,
+      `${process.env.SF_INSTANCE_URL}/services/data/v66.0/actions/custom/flow/Gmail_Create_Lead`,
       {
         method: 'POST',
         headers: {
