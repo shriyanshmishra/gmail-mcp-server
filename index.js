@@ -42,6 +42,7 @@ async function getSalesforceToken() {
     grant_type: 'client_credentials',
     client_id: process.env.SF_CLIENT_ID,
     client_secret: process.env.SF_CLIENT_SECRET,
+    scope: 'api'
   });
 
   const res = await fetch(
@@ -118,7 +119,7 @@ async function triggerAgentforce(emailData) {
 
     // Step 2 — Send Message to Agent
     const msgRes = await fetch(
-      `${process.env.SF_INSTANCE_URL}/services/data/v62.0/einstein/ai-agent/sessions/${sessionIdCreated}/messages`,
+      `${process.env.SF_INSTANCE_URL}/services/data/v66  .0/einstein/ai-agent/sessions/${sessionIdCreated}/messages`,
       {
         method: 'POST',
         headers: {
