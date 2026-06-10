@@ -65,33 +65,11 @@ async function getSalesforceToken() {
 async function triggerAgentforce(emailData) {
   try {
     const token = await getSalesforceToken();
-
     const sessionId = 'auto-' + Date.now();
 
-    const body = {
-      message: {
-        role: 'user',
-        content: [
-          {
-            type: 'text',
-            text: `A new email has arrived in the Gmail inbox. Please process it and create a Salesforce Lead if it is a genuine sales inquiry. DO NOT create a lead if it looks like spam, newsletter, auto-reply, or out-of-office.
-
-Email details:
-From: ${emailData.from}
-Subject: ${emailData.subject}
-Date: ${emailData.date}
-Body:
-${emailData.body}
-
-If this is a qualifying lead, extract the name, company, phone and create the lead. If it is spam or not a sales inquiry, skip it and explain why.`
-          }
-        ]
-      },
-      variables: []
-    };
-
-   const res = await fetch(
-  `${process.env.SF_INSTANCE_URL}/services/data/v62.0/einstein/ai-agent/sessions`,
+    // Step 1 — Create Agent Session
+    const sessionRes = await fetch(
+      `${process.env.SF_INSTANCE_URL}/services/data/v62.0/einstein/ai-agent/sessions`,
       {
         method: 'POST',
         headers: {
@@ -103,33 +81,77 @@ If this is a qualifying lead, extract the name, company, phone and create the le
           agentId: process.env.SF_AGENT_API_NAME,
           instanceConfig: {
             endpoint: process.env.SF_INSTANCE_URL
-          }
+          },
+          streamingCapabilities: {
+            chunkTypes: ['Text']
+          },
+          bypassUser: true
         }),
       }
     );
 
-    const sessionData = await res.json();
-    console.log('Agent session created:', JSON.stringify(sessionData));
+    const sessionText = await sessionRes.text();
+    console.log('Session response status:', sessionRes.status);
+    console.log('Session response:', sessionText);
 
-    if (!sessionData.id) {
-      throw new Error('Failed to create agent session: ' + JSON.stringify(sessionData));
+    let sessionData;
+    try {
+      sessionData = JSON.parse(sessionText);
+    } catch(e) {
+      console.error('Could not parse session response');
+      return;
     }
 
-    // Send message to agent session
+    // Check for errors
+    if (Array.isArray(sessionData) && sessionData[0]?.errorCode) {
+      console.error('Session creation error:', sessionData[0].errorCode, sessionData[0].message);
+      return;
+    }
+
+    const sessionIdCreated = sessionData?.id || sessionData?.sessionId;
+    if (!sessionIdCreated) {
+      console.error('No session ID in response:', sessionText);
+      return;
+    }
+
+    console.log('Agent session created successfully:', sessionIdCreated);
+
+    // Step 2 — Send Message to Agent
     const msgRes = await fetch(
-      `${process.env.SF_INSTANCE_URL}/services/data/v62.0/einstein/ai-agent/sessions/${sessionData.id}/messages`,
+      `${process.env.SF_INSTANCE_URL}/services/data/v62.0/einstein/ai-agent/sessions/${sessionIdCreated}/messages`,
       {
         method: 'POST',
         headers: {
           'Authorization': `Bearer ${token}`,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify(body),
+        body: JSON.stringify({
+          message: {
+            role: 'user',
+            content: [
+              {
+                type: 'text',
+                text: `A new email arrived. Process it and create a Salesforce Lead if genuine sales inquiry. Skip if spam, newsletter, auto-reply, or out-of-office.
+
+From: ${emailData.from}
+Subject: ${emailData.subject}
+Date: ${emailData.date}
+Body:
+${emailData.body}
+
+If qualifying lead: extract name, company, phone and create the lead.
+If not a sales inquiry: skip and explain why.`
+              }
+            ]
+          },
+          variables: []
+        }),
       }
     );
 
-    const msgData = await msgRes.json();
-    console.log('Agent response:', JSON.stringify(msgData));
+    const msgText = await msgRes.text();
+    console.log('Message response status:', msgRes.status);
+    console.log('Agent message response:', msgText);
 
   } catch (error) {
     console.error('Agentforce trigger error:', error.message);
