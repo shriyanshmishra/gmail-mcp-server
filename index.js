@@ -65,44 +65,10 @@ async function getSalesforceToken() {
 async function triggerAgentforce(emailData) {
   try {
     const token = await getSalesforceToken();
-    const agentId = process.env.SF_AGENT_API_NAME;   // ← Yeh add karna zaroori hai .env mein
 
-    if (!agentId) {
-      throw new Error("AGENTFORCE_AGENT_ID missing in environment variables");
-    }
+    const AGENT_ID = '0XxKh000000gWi3KAE';
+    const BASE_URL = 'https://cl1771317101187.my.salesforce.com';
 
-    const baseUrl = process.env.SF_INSTANCE_URL.replace(/\/$/, ''); // clean trailing slash
-
-    // 1. Start Session
-    const sessionResponse = await fetch(
-      ${baseUrl}/einstein/ai-agent/v1/agents/${agentId}/sessions,
-      {
-        method: 'POST',
-        headers: {
-          Authorization: Bearer ${token},
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          // Optional: bypassUser: true  (if you want agent to run under its assigned user)
-        })
-      }
-    );
-
-    if (!sessionResponse.ok) {
-      const errText = await sessionResponse.text();
-      throw new Error(Session creation failed: ${sessionResponse.status} - ${errText});
-    }
-
-    const sessionData = await sessionResponse.json();
-    const sessionId = sessionData.sessionId || sessionData.id;
-
-    if (!sessionId) {
-      throw new Error("Session ID not received from Agentforce");
-    }
-
-    console.log(Agentforce Session started: ${sessionId});
-
-    // 2. Prepare Prompt
     const prompt = `
 You are an autonomous email processing agent.
 
@@ -134,6 +100,8 @@ Rules:
 4. When sufficient information is available:
    - Immediately invoke the CreateSalesLeadRecord action.
    - Do NOT ask for user confirmation.
+   - Do NOT ask follow-up questions.
+   - Do NOT wait for approval.
    - Execute the action automatically.
 
 5. This is a backend automation workflow.
@@ -160,13 +128,44 @@ Body:
 ${emailData.body}
 `;
 
-    // 3. Send Message (Synchronous)
-    const messageResponse = await fetch(
-      ${baseUrl}/einstein/ai-agent/v1/sessions/${sessionId}/messages?sync=true,
+    // ── Step 1: Create Session ──────────────────────────
+    console.log('Creating Agentforce session...');
+    const sessionRes = await fetch(
+      `${BASE_URL}/services/einstein/ai/v1/agents/${AGENT_ID}/sessions`,
       {
         method: 'POST',
         headers: {
-          Authorization: Bearer ${token},
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          externalSessionKey: `gmail-${Date.now()}`,
+          bypassUser: true,
+        }),
+      }
+    );
+
+    if (!sessionRes.ok) {
+      const errText = await sessionRes.text();
+      throw new Error(`Session creation failed ${sessionRes.status}: ${errText}`);
+    }
+
+    const sessionData = await sessionRes.json();
+    const sessionId = sessionData.sessionId || sessionData.id;
+    console.log('Agentforce Session created:', sessionId);
+
+    if (!sessionId) {
+      throw new Error('Session ID not received from Agentforce');
+    }
+
+    // ── Step 2: Send Message ────────────────────────────
+    console.log('Sending message to Agentforce...');
+    const msgRes = await fetch(
+      `${BASE_URL}/services/einstein/ai/v1/agents/${AGENT_ID}/sessions/${sessionId}/messages`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
@@ -175,24 +174,32 @@ ${emailData.body}
             content: [
               {
                 type: 'text',
-                text: prompt
-              }
-            ]
-          }
-        })
+                text: prompt,
+              },
+            ],
+          },
+          bypassUser: true,
+        }),
       }
     );
 
-    if (!messageResponse.ok) {
-      const errText = await messageResponse.text();
-      throw new Error(Message send failed: ${messageResponse.status} - ${errText});
+    if (!msgRes.ok) {
+      const errText = await msgRes.text();
+      throw new Error(`Message send failed ${msgRes.status}: ${errText}`);
     }
 
-    const result = await messageResponse.json();
+    const result = await msgRes.json();
     console.log('Agentforce Response:', JSON.stringify(result, null, 2));
 
-    // Optional: End Session (good practice)
-    // await fetch(${baseUrl}/einstein/ai-agent/v1/sessions/${sessionId}, { method: 'DELETE', headers: { Authorization: Bearer ${token} } });
+    // ── Step 3: End Session (cleanup) ──────────────────
+    await fetch(
+      `${BASE_URL}/services/einstein/ai/v1/agents/${AGENT_ID}/sessions/${sessionId}`,
+      {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` },
+      }
+    );
+    console.log('Agentforce session closed.');
 
     return result;
 
@@ -201,6 +208,7 @@ ${emailData.body}
     throw error;
   }
 }
+
 // ── Spam Check ────────────────────────────────────────────
 async function isSpamOrUnwanted(messageId) {
   try {
@@ -215,13 +223,11 @@ async function isSpamOrUnwanted(messageId) {
     const labels = msg.data.labelIds || [];
     console.log('Message labels:', labels);
 
-    // Skip if Gmail marked as spam or trash
     if (labels.includes('SPAM') || labels.includes('TRASH')) {
       console.log('Skipping — Gmail marked as SPAM or TRASH');
       return true;
     }
 
-    // Skip if it is not in INBOX
     if (!labels.includes('INBOX')) {
       console.log('Skipping — not in INBOX');
       return true;
@@ -256,14 +262,12 @@ app.post('/gmail-webhook', async (req, res) => {
     const newHistoryId = decoded.historyId;
     if (!newHistoryId) return;
 
-    // First push — just store historyId, nothing to compare yet
     if (!lastHistoryId) {
       console.log('First push — storing historyId:', newHistoryId);
       lastHistoryId = newHistoryId;
       return;
     }
 
-    // Fetch history since LAST known historyId
     const gmail = getGmail();
     let history;
     try {
@@ -278,7 +282,6 @@ app.post('/gmail-webhook', async (req, res) => {
       return;
     }
 
-    // Update stored historyId
     lastHistoryId = newHistoryId;
 
     const records = history.data.history || [];
@@ -289,7 +292,6 @@ app.post('/gmail-webhook', async (req, res) => {
       return;
     }
 
-    // Process each new message
     for (const record of records) {
       if (!record.messagesAdded) continue;
 
@@ -297,14 +299,12 @@ app.post('/gmail-webhook', async (req, res) => {
         const messageId = added.message.id;
         console.log('Processing message:', messageId);
 
-        // Spam check
         const spam = await isSpamOrUnwanted(messageId);
         if (spam) {
           console.log('Skipped — spam or unwanted:', messageId);
           continue;
         }
 
-        // Get full email
         const msg = await gmail.users.messages.get({
           userId: 'me',
           id: messageId,
@@ -324,7 +324,6 @@ app.post('/gmail-webhook', async (req, res) => {
         console.log('Email from:', emailData.from);
         console.log('Subject:', emailData.subject);
 
-        // Pass raw email payload to Agentforce — it handles lead creation via standard action
         await triggerAgentforce(emailData);
       }
     }
