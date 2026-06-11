@@ -65,7 +65,44 @@ async function getSalesforceToken() {
 async function triggerAgentforce(emailData) {
   try {
     const token = await getSalesforceToken();
+    const agentId = process.env.SF_AGENT_API_NAME;   // ← Yeh add karna zaroori hai .env mein
 
+    if (!agentId) {
+      throw new Error("AGENTFORCE_AGENT_ID missing in environment variables");
+    }
+
+    const baseUrl = process.env.SF_INSTANCE_URL.replace(/\/$/, ''); // clean trailing slash
+
+    // 1. Start Session
+    const sessionResponse = await fetch(
+      ${baseUrl}/einstein/ai-agent/v1/agents/${agentId}/sessions,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: Bearer ${token},
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          // Optional: bypassUser: true  (if you want agent to run under its assigned user)
+        })
+      }
+    );
+
+    if (!sessionResponse.ok) {
+      const errText = await sessionResponse.text();
+      throw new Error(Session creation failed: ${sessionResponse.status} - ${errText});
+    }
+
+    const sessionData = await sessionResponse.json();
+    const sessionId = sessionData.sessionId || sessionData.id;
+
+    if (!sessionId) {
+      throw new Error("Session ID not received from Agentforce");
+    }
+
+    console.log(Agentforce Session started: ${sessionId});
+
+    // 2. Prepare Prompt
     const prompt = `
 You are an autonomous email processing agent.
 
@@ -92,13 +129,11 @@ Rules:
      * Email Address
      * Company
      * Phone Number
-     * Lead Description
+     * Lead Description / Notes
 
 4. When sufficient information is available:
    - Immediately invoke the CreateSalesLeadRecord action.
    - Do NOT ask for user confirmation.
-   - Do NOT ask follow-up questions.
-   - Do NOT wait for approval.
    - Execute the action automatically.
 
 5. This is a backend automation workflow.
@@ -113,7 +148,7 @@ Rules:
    - Do not create a lead.
    - Return the reason.
 
-Never request confirmation before creating a lead. Never ask "Would you like me to create the lead?" Never ask "Please confirm." Always execute the action automatically when qualification criteria are met.
+Never request confirmation before creating a lead. Always execute automatically when criteria are met.
 
 EMAIL DETAILS
 
@@ -125,12 +160,13 @@ Body:
 ${emailData.body}
 `;
 
-    const response = await fetch(
-      `${process.env.SF_INSTANCE_URL}${process.env.SF_AGENTFORCE_ENDPOINT}`,
+    // 3. Send Message (Synchronous)
+    const messageResponse = await fetch(
+      ${baseUrl}/einstein/ai-agent/v1/sessions/${sessionId}/messages?sync=true,
       {
         method: 'POST',
         headers: {
-          Authorization: `Bearer ${token}`,
+          Authorization: Bearer ${token},
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
@@ -139,21 +175,25 @@ ${emailData.body}
             content: [
               {
                 type: 'text',
-                text: prompt,
-              },
-            ],
-          },
-        }),
+                text: prompt
+              }
+            ]
+          }
+        })
       }
     );
 
-    if (!response.ok) {
-      const errText = await response.text();
-      throw new Error(`Agentforce HTTP ${response.status}: ${errText}`);
+    if (!messageResponse.ok) {
+      const errText = await messageResponse.text();
+      throw new Error(Message send failed: ${messageResponse.status} - ${errText});
     }
 
-    const result = await response.json();
+    const result = await messageResponse.json();
     console.log('Agentforce Response:', JSON.stringify(result, null, 2));
+
+    // Optional: End Session (good practice)
+    // await fetch(${baseUrl}/einstein/ai-agent/v1/sessions/${sessionId}, { method: 'DELETE', headers: { Authorization: Bearer ${token} } });
+
     return result;
 
   } catch (error) {
@@ -161,7 +201,6 @@ ${emailData.body}
     throw error;
   }
 }
-
 // ── Spam Check ────────────────────────────────────────────
 async function isSpamOrUnwanted(messageId) {
   try {
