@@ -61,60 +61,107 @@ async function getSalesforceToken() {
   return data.access_token;
 }
 
-// ── Create Lead via Salesforce Flow directly ──────────────
+// ── Trigger Agentforce with raw email payload ─────────────
 async function triggerAgentforce(emailData) {
   try {
     const token = await getSalesforceToken();
 
-    // Extract name from "John Smith <john@example.com>"
-    const fromMatch = emailData.from.match(/^([^<]+)/);
-    const fullName = fromMatch ? fromMatch[1].trim() : 'Unknown';
-    const nameParts = fullName.split(' ');
-    const firstName = nameParts[0] || 'Unknown';
-    const lastName = nameParts.slice(1).join(' ') || 'Unknown';
+    const prompt = `
+You are an autonomous email processing agent.
 
-    // Extract email address
-    const emailMatch = emailData.from.match(/<([^>]+)>/);
-    const emailAddress = emailMatch ? emailMatch[1] : emailData.from;
+Your purpose is to analyze incoming emails and automatically create Salesforce Leads when appropriate.
 
-    // Extract company from email domain
-    const domainMatch = emailAddress.match(/@([^.]+)/);
-    const company = domainMatch
-      ? domainMatch[1].charAt(0).toUpperCase() + domainMatch[1].slice(1)
-      : 'Unknown Company';
+Rules:
 
-    console.log('Creating lead for:', firstName, lastName, emailAddress, company);
+1. Analyze the email content and determine whether it is:
+   - Spam
+   - Marketing newsletter
+   - Automated notification
+   - Potential sales inquiry
+   - Business opportunity
 
-    // Call Salesforce Flow directly via REST API
-    const flowRes = await fetch(
-      `${process.env.SF_INSTANCE_URL}/services/data/v66.0/actions/custom/flow/Gmail_Create_Lead`,
+2. If the email is spam, a newsletter, or an automated notification:
+   - Do not create any records.
+   - Return the reason for rejection.
+
+3. If the email indicates interest in products, services, consulting, partnerships, pricing, demos, implementations, or business discussions:
+   - Treat the sender as a potential lead.
+   - Extract all available information:
+     * First Name
+     * Last Name
+     * Email Address
+     * Company
+     * Phone Number
+     * Lead Description
+
+4. When sufficient information is available:
+   - Immediately invoke the CreateSalesLeadRecord action.
+   - Do NOT ask for user confirmation.
+   - Do NOT ask follow-up questions.
+   - Do NOT wait for approval.
+   - Execute the action automatically.
+
+5. This is a backend automation workflow.
+   - The incoming email is the source of truth.
+   - Assume permission to create records has already been granted.
+
+6. After successful creation:
+   - Return the Salesforce Lead Id.
+   - Return a summary of the extracted information.
+
+7. If required fields cannot be determined with reasonable confidence:
+   - Do not create a lead.
+   - Return the reason.
+
+Never request confirmation before creating a lead. Never ask "Would you like me to create the lead?" Never ask "Please confirm." Always execute the action automatically when qualification criteria are met.
+
+EMAIL DETAILS
+
+From: ${emailData.from}
+Subject: ${emailData.subject}
+Date: ${emailData.date}
+
+Body:
+${emailData.body}
+`;
+
+    const response = await fetch(
+      `${process.env.SF_INSTANCE_URL}${process.env.SF_AGENTFORCE_ENDPOINT}`,
       {
         method: 'POST',
         headers: {
-          'Authorization': `Bearer ${token}`,
+          Authorization: `Bearer ${token}`,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          inputs: [{
-            leadFirstName: firstName,
-            leadLastName: lastName,
-            leadEmail: emailAddress,
-            leadCompany: company,
-            leadPhone: '',
-            leadDescription: `Auto-created from email. Subject: ${emailData.subject}. Body: ${emailData.body.substring(0, 500)}`
-          }]
+          message: {
+            role: 'user',
+            content: [
+              {
+                type: 'text',
+                text: prompt,
+              },
+            ],
+          },
         }),
       }
     );
 
-    const flowText = await flowRes.text();
-    console.log('Flow response status:', flowRes.status);
-    console.log('Flow response:', flowText);
+    if (!response.ok) {
+      const errText = await response.text();
+      throw new Error(`Agentforce HTTP ${response.status}: ${errText}`);
+    }
+
+    const result = await response.json();
+    console.log('Agentforce Response:', JSON.stringify(result, null, 2));
+    return result;
 
   } catch (error) {
-    console.error('Lead creation error:', error.message);
+    console.error('Agentforce Error:', error.message);
+    throw error;
   }
 }
+
 // ── Spam Check ────────────────────────────────────────────
 async function isSpamOrUnwanted(messageId) {
   try {
@@ -238,7 +285,7 @@ app.post('/gmail-webhook', async (req, res) => {
         console.log('Email from:', emailData.from);
         console.log('Subject:', emailData.subject);
 
-        // Trigger Agentforce
+        // Pass raw email payload to Agentforce — it handles lead creation via standard action
         await triggerAgentforce(emailData);
       }
     }
@@ -313,7 +360,7 @@ app.get('/search', async (req, res) => {
   }
 });
 
-// ── MCP Endpoint (kept for future use) ───────────────────
+// ── MCP Endpoint ──────────────────────────────────────────
 function registerTools(server) {
   server.tool('gmail_list_messages', 'List unread Gmail messages.',
     { maxResults: z.number().optional().default(10) },
@@ -374,12 +421,10 @@ app.get('/auth', (req, res) => {
 
 app.get('/', (req, res) => res.json({ status: 'Gmail MCP Server running', version: '1.0.0' }));
 
-
 // ── Start Server ──────────────────────────────────────────
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, async () => {
   console.log(`Gmail MCP Server running on port ${PORT}`);
-  // Register Gmail watch on startup
   await registerGmailWatch();
 });
 
@@ -387,7 +432,7 @@ app.listen(PORT, async () => {
 setInterval(registerGmailWatch, 6 * 24 * 60 * 60 * 1000);
 
 // ── Keep Server Awake (Render free tier) ──────────────────
-const SELF_URL = 'https://gmail-mcp-server-himw.onrender.com/';
+const SELF_URL = process.env.SELF_URL || 'https://gmail-mcp-server-himw.onrender.com/';
 setInterval(async () => {
   try {
     await fetch(SELF_URL);
@@ -395,4 +440,4 @@ setInterval(async () => {
   } catch (e) {
     console.error('Keep-alive failed:', e.message);
   }
-}, 10 * 60 * 1000); // every 10 minutes
+}, 10 * 60 * 1000);
