@@ -64,7 +64,7 @@ async function getSalesforceToken() {
 // ── Send a single message to Agentforce session ───────────
 async function sendAgentMessage(token, sessionId, text, sequenceId) {
   const res = await fetch(
-    `https://api.salesforce.com/einstein/ai-agent/v1/sessions/${sessionId}/messages`,
+    `${process.env.SF_INSTANCE_URL}/einstein/ai-agent/v1/sessions/${sessionId}/messages`,
     {
       method: 'POST',
       headers: {
@@ -100,7 +100,7 @@ async function triggerAgentforce(emailData) {
 
   try {
     const AGENT_ID  = process.env.SF_AGENT_ID || '0XxKh000000gWi3KAE';
-    const API_BASE  = 'https://api.salesforce.com/einstein/ai-agent/v1';
+    const API_BASE  = '${process.env.SF_INSTANCE_URL}/einstein/ai-agent/v1';
 
     // ── Step 1: Create Session ──────────────────────────
     console.log('Creating Agentforce session...');
