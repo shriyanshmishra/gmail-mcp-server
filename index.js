@@ -61,54 +61,161 @@ async function getSalesforceToken() {
   return data.access_token;
 }
 
-// ── Trigger Agentforce via correct endpoints ──────────────
+// ── Send a single message to Agentforce session ───────────
+async function sendAgentMessage(token, sessionId, text, sequenceId) {
+  const res = await fetch(
+    `https://api.salesforce.com/einstein/ai-agent/v1/sessions/${sessionId}/messages`,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        message: {
+          sequenceId,
+          type: 'Text',
+          text,
+        },
+        variables: [],
+      }),
+    }
+  );
+
+  const responseText = await res.text();
+  console.log(`Message (seq ${sequenceId}) response status:`, res.status);
+  console.log(`Message (seq ${sequenceId}) response:`, responseText);
+
+  if (!res.ok) {
+    throw new Error(`Message send failed ${res.status}: ${responseText}`);
+  }
+
+  return JSON.parse(responseText);
+}
+
+// ── Trigger Agentforce ────────────────────────────────────
 async function triggerAgentforce(emailData) {
+  let sessionId = null;
+  const token = await getSalesforceToken();
+
   try {
-    // Step 1 — Get Salesforce Token
-    const token = await getSalesforceToken();
+    const AGENT_ID  = process.env.SF_AGENT_ID || '0XxKh000000gWi3KAE';
+    const API_BASE  = 'https://api.salesforce.com/einstein/ai-agent/v1';
 
-    // HARDCODED SESSION ID FOR TESTING
-    const sessionId = 'a20ef808-4c87-4b40-a74c-23c0afde11f0';
-    console.log('Using hardcoded session ID:', sessionId);
-
-    // Step 2 — Send message to Agentforce
-    console.log('Sending message to Agentforce...');
-    const agentRes = await fetch(
-      `${process.env.SF_INSTANCE_URL}/services/data/v66.0/actions/custom/generateAiAgentResponse/Gmail_Lead_Ingestion_Agent`,
+    // ── Step 1: Create Session ──────────────────────────
+    console.log('Creating Agentforce session...');
+    const sessionRes = await fetch(
+      `${API_BASE}/agents/${AGENT_ID}/sessions`,
       {
         method: 'POST',
         headers: {
-          'Authorization': `Bearer ${token}`,
+          Authorization: `Bearer ${token}`,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          inputs: [{
-            sessionId: sessionId,
-            userMessage: `A new email has arrived in the Gmail inbox. Please process it and create a Salesforce Lead if it is a genuine inbound sales inquiry.
-
-SKIP if: spam, newsletter, promotional, auto-reply, out-of-office, notification.
-CREATE LEAD if: genuine sales inquiry, demo request, pricing question, product interest.
-
-Email Details:
-From: ${emailData.from}
-Subject: ${emailData.subject}
-Date: ${emailData.date}
-Body:
-${emailData.body}
-
-If qualifying: extract First Name, Last Name, Email, Company, Phone and create the lead.
-If not qualifying: explain why it was skipped.`
-          }]
+          externalSessionKey: `gmail-${Date.now()}`,
+          instanceConfig: {
+            endpoint: process.env.SF_INSTANCE_URL,
+          },
+          streamingCapabilities: {
+            chunkTypes: ['Text'],
+          },
+          bypassUser: true,
         }),
       }
     );
 
-    const agentText = await agentRes.text();
-    console.log('Agent response status:', agentRes.status);
-    console.log('Agent response:', agentText);
+    if (!sessionRes.ok) {
+      const errText = await sessionRes.text();
+      throw new Error(`Session creation failed ${sessionRes.status}: ${errText}`);
+    }
+
+    const sessionData = await sessionRes.json();
+    sessionId = sessionData.sessionId || sessionData.id;
+    console.log('Agentforce session created:', sessionId);
+
+    if (!sessionId) {
+      throw new Error('Session ID not received: ' + JSON.stringify(sessionData));
+    }
+
+    // ── Step 2: Send Email as First Message ─────────────
+    const prompt = `You are an autonomous email processing agent.
+
+Your purpose is to analyze incoming emails and automatically create Salesforce Leads when appropriate.
+
+Rules:
+1. Analyze the email content and determine whether it is spam, marketing newsletter, automated notification, or a potential sales inquiry.
+2. If spam, newsletter, or automated: do NOT create any records. Return the reason for rejection.
+3. If it indicates interest in products, services, consulting, partnerships, pricing, demos, implementations, or business discussions: treat sender as a potential lead.
+4. Extract all available information: First Name, Last Name, Email Address, Company, Phone Number, Lead Description.
+5. When sufficient information is available: immediately invoke the CreateSalesLeadRecord action. Do NOT ask for confirmation. Do NOT ask follow-up questions. Execute automatically.
+6. This is a backend automation workflow. Assume permission to create records has already been granted.
+7. After successful creation: return the Salesforce Lead Id and a summary.
+8. If required fields cannot be determined: do not create a lead. Return the reason.
+
+Never request confirmation before creating a lead. Always execute automatically when criteria are met.
+
+EMAIL DETAILS
+From: ${emailData.from}
+Subject: ${emailData.subject}
+Date: ${emailData.date}
+Body:
+${emailData.body}`;
+
+    const firstResponse = await sendAgentMessage(token, sessionId, prompt, 1);
+
+    // ── Step 3: Auto-reply if agent asks for confirmation ─
+    let agentMessage = '';
+
+    // Extract message text from response
+    if (firstResponse?.messages?.length > 0) {
+      agentMessage = firstResponse.messages[0]?.message || '';
+    } else if (firstResponse?.outputValues?.agentResponse) {
+      try {
+        const parsed = JSON.parse(firstResponse.outputValues.agentResponse);
+        agentMessage = parsed?.value || '';
+      } catch {
+        agentMessage = firstResponse.outputValues.agentResponse || '';
+      }
+    }
+
+    console.log('Agent message received:', agentMessage);
+
+    // Check if agent is asking for confirmation
+    const askingForConfirmation =
+      agentMessage.toLowerCase().includes('yes') ||
+      agentMessage.toLowerCase().includes('proceed') ||
+      agentMessage.toLowerCase().includes('confirm') ||
+      agentMessage.toLowerCase().includes('would you like') ||
+      agentMessage.toLowerCase().includes('shall i') ||
+      agentMessage.toLowerCase().includes('go ahead');
+
+    if (askingForConfirmation) {
+      console.log('Agent asked for confirmation — auto-replying "yes"...');
+      const confirmResponse = await sendAgentMessage(token, sessionId, 'yes', 2);
+      console.log('Confirmation response:', JSON.stringify(confirmResponse, null, 2));
+    }
+
+    console.log('Agentforce processing complete.');
 
   } catch (error) {
-    console.error('Agentforce trigger error:', error.message);
+    console.error('Agentforce Error:', error.message);
+  } finally {
+    // ── Step 4: Always End Session (cleanup) ────────────
+    if (sessionId) {
+      try {
+        await fetch(
+          `https://api.salesforce.com/einstein/ai-agent/v1/sessions/${sessionId}`,
+          {
+            method: 'DELETE',
+            headers: { Authorization: `Bearer ${token}` },
+          }
+        );
+        console.log('Agentforce session closed:', sessionId);
+      } catch (err) {
+        console.error('Session close error:', err.message);
+      }
+    }
   }
 }
 
@@ -179,7 +286,7 @@ app.post('/gmail-webhook', async (req, res) => {
         historyTypes: ['messageAdded'],
       });
     } catch (err) {
-      console.log('History fetch failed:', err.message);
+      console.log('History fetch failed, updating historyId:', err.message);
       lastHistoryId = newHistoryId;
       return;
     }
@@ -201,14 +308,12 @@ app.post('/gmail-webhook', async (req, res) => {
         const messageId = added.message.id;
         console.log('Processing message:', messageId);
 
-        // Spam check
         const spam = await isSpamOrUnwanted(messageId);
         if (spam) {
           console.log('Skipped — spam or unwanted:', messageId);
           continue;
         }
 
-        // Get full email
         const msg = await gmail.users.messages.get({
           userId: 'me',
           id: messageId,
@@ -228,7 +333,6 @@ app.post('/gmail-webhook', async (req, res) => {
         console.log('Email from:', emailData.from);
         console.log('Subject:', emailData.subject);
 
-        // Trigger Agentforce
         await triggerAgentforce(emailData);
       }
     }
@@ -255,7 +359,7 @@ async function registerGmailWatch() {
   }
 }
 
-// ── REST Endpoints (Salesforce External Services) ─────────
+// ── REST Endpoints ─────────────────────────────────────────
 app.get('/list', async (req, res) => {
   try {
     const maxResults = parseInt(req.query.maxResults) || 10;
@@ -302,7 +406,7 @@ app.get('/search', async (req, res) => {
   }
 });
 
-// ── MCP Endpoint (for Agentforce manual preview) ─────────
+// ── MCP Endpoint ──────────────────────────────────────────
 function registerTools(server) {
   server.tool('gmail_list_messages', 'List unread Gmail messages.',
     { maxResults: z.number().optional().default(10) },
@@ -329,7 +433,6 @@ function registerTools(server) {
   );
 }
 
-// FIX: Create new McpServer per request — global instance crashes on second request
 app.all('/mcp', async (req, res) => {
   try {
     const server = new McpServer({ name: 'gmail-mcp-server', version: '1.0.0' });
@@ -371,11 +474,11 @@ app.listen(PORT, async () => {
   await registerGmailWatch();
 });
 
-// Auto-renew Gmail watch every 6 days (expires after 7 days)
+// Auto-renew Gmail watch every 6 days
 setInterval(registerGmailWatch, 6 * 24 * 60 * 60 * 1000);
 
 // ── Keep Server Awake (Render free tier) ──────────────────
-const SELF_URL = 'https://gmail-mcp-server-himw.onrender.com/';
+const SELF_URL = process.env.SELF_URL || 'https://gmail-mcp-server-himw.onrender.com/';
 setInterval(async () => {
   try {
     await fetch(SELF_URL);
@@ -383,4 +486,4 @@ setInterval(async () => {
   } catch (e) {
     console.error('Keep-alive failed:', e.message);
   }
-}, 4 * 60 * 1000); // every 4 minutes
+}, 4 * 60 * 1000);
