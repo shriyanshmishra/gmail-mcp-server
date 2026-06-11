@@ -61,13 +61,16 @@ async function getSalesforceToken() {
   return data.access_token;
 }
 
-// ── Trigger Agentforce with raw email payload ─────────────
+// ── Trigger Agentforce ────────────────────────────────────
+// ✅ CORRECT endpoint: https://api.salesforce.com/einstein/ai-agent/v1/...
+// ✅ instanceConfig.endpoint must be your My Domain URL
 async function triggerAgentforce(emailData) {
   try {
     const token = await getSalesforceToken();
 
-    const AGENT_ID = '0XxKh000000gWi3KAE';
-    const BASE_URL = 'https://cl1771317101187.my.salesforce.com';
+    const AGENT_ID      = '0XxKh000000gWi3KAE';
+    const MY_DOMAIN_URL = 'https://cl1771317101187.my.salesforce.com';
+    const API_BASE      = 'https://api.salesforce.com/einstein/ai-agent/v1';
 
     const prompt = `
 You are an autonomous email processing agent.
@@ -87,7 +90,8 @@ Rules:
    - Do not create any records.
    - Return the reason for rejection.
 
-3. If the email indicates interest in products, services, consulting, partnerships, pricing, demos, implementations, or business discussions:
+3. If the email indicates interest in products, services, consulting, partnerships, pricing, demos,
+   implementations, or business discussions:
    - Treat the sender as a potential lead.
    - Extract all available information:
      * First Name
@@ -130,8 +134,10 @@ ${emailData.body}
 
     // ── Step 1: Create Session ──────────────────────────
     console.log('Creating Agentforce session...');
+    console.log('Session URL:', `${API_BASE}/agents/${AGENT_ID}/sessions`);
+
     const sessionRes = await fetch(
-      `${BASE_URL}/services/einstein/ai/v1/agents/${AGENT_ID}/sessions`,
+      `${API_BASE}/agents/${AGENT_ID}/sessions`,
       {
         method: 'POST',
         headers: {
@@ -140,6 +146,12 @@ ${emailData.body}
         },
         body: JSON.stringify({
           externalSessionKey: `gmail-${Date.now()}`,
+          instanceConfig: {
+            endpoint: MY_DOMAIN_URL,
+          },
+          streamingCapabilities: {
+            chunkTypes: ['Text'],
+          },
           bypassUser: true,
         }),
       }
@@ -152,16 +164,16 @@ ${emailData.body}
 
     const sessionData = await sessionRes.json();
     const sessionId = sessionData.sessionId || sessionData.id;
-    console.log('Agentforce Session created:', sessionId);
+    console.log('Agentforce session created:', sessionId);
 
     if (!sessionId) {
-      throw new Error('Session ID not received from Agentforce');
+      throw new Error('Session ID not received: ' + JSON.stringify(sessionData));
     }
 
-    // ── Step 2: Send Message ────────────────────────────
+    // ── Step 2: Send Message (Synchronous) ─────────────
     console.log('Sending message to Agentforce...');
     const msgRes = await fetch(
-      `${BASE_URL}/services/einstein/ai/v1/agents/${AGENT_ID}/sessions/${sessionId}/messages`,
+      `${API_BASE}/sessions/${sessionId}/messages`,
       {
         method: 'POST',
         headers: {
@@ -170,15 +182,11 @@ ${emailData.body}
         },
         body: JSON.stringify({
           message: {
-            role: 'user',
-            content: [
-              {
-                type: 'text',
-                text: prompt,
-              },
-            ],
+            sequenceId: 1,
+            type: 'Text',
+            text: prompt,
           },
-          bypassUser: true,
+          variables: [],
         }),
       }
     );
@@ -192,13 +200,10 @@ ${emailData.body}
     console.log('Agentforce Response:', JSON.stringify(result, null, 2));
 
     // ── Step 3: End Session (cleanup) ──────────────────
-    await fetch(
-      `${BASE_URL}/services/einstein/ai/v1/agents/${AGENT_ID}/sessions/${sessionId}`,
-      {
-        method: 'DELETE',
-        headers: { Authorization: `Bearer ${token}` },
-      }
-    );
+    await fetch(`${API_BASE}/sessions/${sessionId}`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${token}` },
+    });
     console.log('Agentforce session closed.');
 
     return result;
@@ -351,7 +356,7 @@ async function registerGmailWatch() {
   }
 }
 
-// ── REST Endpoints (Salesforce External Services) ─────────
+// ── REST Endpoints ─────────────────────────────────────────
 app.get('/list', async (req, res) => {
   try {
     const maxResults = parseInt(req.query.maxResults) || 10;
@@ -466,7 +471,7 @@ app.listen(PORT, async () => {
   await registerGmailWatch();
 });
 
-// Auto-renew Gmail watch every 6 days (expires after 7 days)
+// Auto-renew Gmail watch every 6 days
 setInterval(registerGmailWatch, 6 * 24 * 60 * 60 * 1000);
 
 // ── Keep Server Awake (Render free tier) ──────────────────
