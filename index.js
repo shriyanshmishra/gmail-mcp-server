@@ -67,51 +67,11 @@ async function triggerAgentforce(emailData) {
     // Step 1 — Get Salesforce Token
     const token = await getSalesforceToken();
 
-    // Step 2 — Create Agent Session
-    console.log('Creating Agentforce session...');
-    const sessionRes = await fetch(
-      `https://api.salesforce.com/einstein/ai-agent/v1/agents/${process.env.SF_AGENT_API_NAME}/sessions`,
-      {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${token}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          externalSessionKey: 'auto-' + Date.now(),
-          instanceConfig: {
-            endpoint: process.env.SF_INSTANCE_URL
-          }
-        }),
-      }
-    );
+    // HARDCODED SESSION ID FOR TESTING
+    const sessionId = 'a20ef808-4c87-4b40-a74c-23c0afde11f0';
+    console.log('Using hardcoded session ID:', sessionId);
 
-    const sessionText = await sessionRes.text();
-    console.log('Session response status:', sessionRes.status);
-    console.log('Session response:', sessionText);
-
-    let sessionData;
-    try {
-      sessionData = JSON.parse(sessionText);
-    } catch(e) {
-      console.error('Could not parse session response:', sessionText);
-      return;
-    }
-
-    // Handle errors
-    if (Array.isArray(sessionData) && sessionData[0]?.errorCode) {
-      console.error('Session error:', sessionData[0].errorCode, sessionData[0].message);
-      return;
-    }
-
-    const sessionId = sessionData?.id || sessionData?.sessionId || sessionData?.session?.id;
-    if (!sessionId) {
-      console.error('No session ID in response:', sessionText);
-      return;
-    }
-    console.log('Agent session created:', sessionId);
-
-    // Step 3 — Send message to Agentforce via generateAiAgentResponse
+    // Step 2 — Send message to Agentforce
     console.log('Sending message to Agentforce...');
     const agentRes = await fetch(
       `${process.env.SF_INSTANCE_URL}/services/data/v66.0/actions/custom/generateAiAgentResponse/Gmail_Lead_Ingestion_Agent`,
@@ -124,7 +84,7 @@ async function triggerAgentforce(emailData) {
         body: JSON.stringify({
           inputs: [{
             sessionId: sessionId,
-            message: `A new email has arrived in the Gmail inbox. Please process it and create a Salesforce Lead if it is a genuine inbound sales inquiry.
+            userMessage: `A new email has arrived in the Gmail inbox. Please process it and create a Salesforce Lead if it is a genuine inbound sales inquiry.
 
 SKIP if: spam, newsletter, promotional, auto-reply, out-of-office, notification.
 CREATE LEAD if: genuine sales inquiry, demo request, pricing question, product interest.
@@ -146,18 +106,6 @@ If not qualifying: explain why it was skipped.`
     const agentText = await agentRes.text();
     console.log('Agent response status:', agentRes.status);
     console.log('Agent response:', agentText);
-
-    // Step 4 — End Agent Session
-    if (sessionId) {
-      await fetch(
-        `https://api.salesforce.com/einstein/ai-agent/v1/sessions/${sessionId}`,
-        {
-          method: 'DELETE',
-          headers: { 'Authorization': `Bearer ${token}` },
-        }
-      );
-      console.log('Agent session closed.');
-    }
 
   } catch (error) {
     console.error('Agentforce trigger error:', error.message);
