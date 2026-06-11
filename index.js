@@ -61,164 +61,113 @@ async function getSalesforceToken() {
   return data.access_token;
 }
 
-// ── Trigger Agentforce ────────────────────────────────────
-// ✅ CORRECT endpoint: https://api.salesforce.com/einstein/ai-agent/v1/...
-// ✅ instanceConfig.endpoint must be your My Domain URL
+// ── Trigger Agentforce via correct endpoints ──────────────
 async function triggerAgentforce(emailData) {
   try {
+    // Step 1 — Get Salesforce Token
     const token = await getSalesforceToken();
 
-    const AGENT_ID      = '0XxKh000000gWi3KAE';
-    const MY_DOMAIN_URL = 'https://cl1771317101187.my.salesforce.com';
-    const API_BASE      = 'https://api.salesforce.com/einstein/ai-agent/v1';
+    // Step 2 — Create Agent Session
+    console.log('Creating Agentforce session...');
+    const sessionRes = await fetch(
+      `https://api.salesforce.com/einstein/ai-agent/v1/agents/${process.env.SF_AGENT_API_NAME}/sessions`,
+      {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          externalSessionKey: 'auto-' + Date.now(),
+          instanceConfig: {
+            endpoint: process.env.SF_INSTANCE_URL
+          }
+        }),
+      }
+    );
 
-    const prompt = `
-You are an autonomous email processing agent.
+    const sessionText = await sessionRes.text();
+    console.log('Session response status:', sessionRes.status);
+    console.log('Session response:', sessionText);
 
-Your purpose is to analyze incoming emails and automatically create Salesforce Leads when appropriate.
+    let sessionData;
+    try {
+      sessionData = JSON.parse(sessionText);
+    } catch(e) {
+      console.error('Could not parse session response:', sessionText);
+      return;
+    }
 
-Rules:
+    // Handle errors
+    if (Array.isArray(sessionData) && sessionData[0]?.errorCode) {
+      console.error('Session error:', sessionData[0].errorCode, sessionData[0].message);
+      return;
+    }
 
-1. Analyze the email content and determine whether it is:
-   - Spam
-   - Marketing newsletter
-   - Automated notification
-   - Potential sales inquiry
-   - Business opportunity
+    const sessionId = sessionData?.id || sessionData?.sessionId || sessionData?.session?.id;
+    if (!sessionId) {
+      console.error('No session ID in response:', sessionText);
+      return;
+    }
+    console.log('Agent session created:', sessionId);
 
-2. If the email is spam, a newsletter, or an automated notification:
-   - Do not create any records.
-   - Return the reason for rejection.
+    // Step 3 — Send message to Agentforce via generateAiAgentResponse
+    console.log('Sending message to Agentforce...');
+    const agentRes = await fetch(
+      `${process.env.SF_INSTANCE_URL}/services/data/v66.0/actions/custom/generateAiAgentResponse/Gmail_Lead_Ingestion_Agent`,
+      {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          inputs: [{
+            sessionId: sessionId,
+            message: `A new email has arrived in the Gmail inbox. Please process it and create a Salesforce Lead if it is a genuine inbound sales inquiry.
 
-3. If the email indicates interest in products, services, consulting, partnerships, pricing, demos,
-   implementations, or business discussions:
-   - Treat the sender as a potential lead.
-   - Extract all available information:
-     * First Name
-     * Last Name
-     * Email Address
-     * Company
-     * Phone Number
-     * Lead Description / Notes
+SKIP if: spam, newsletter, promotional, auto-reply, out-of-office, notification.
+CREATE LEAD if: genuine sales inquiry, demo request, pricing question, product interest.
 
-4. When sufficient information is available:
-   - Immediately invoke the CreateSalesLeadRecord action.
-   - Do NOT ask for user confirmation.
-   - Do NOT ask follow-up questions.
-   - Do NOT wait for approval.
-   - Execute the action automatically.
-
-5. This is a backend automation workflow.
-   - The incoming email is the source of truth.
-   - Assume permission to create records has already been granted.
-
-6. After successful creation:
-   - Return the Salesforce Lead Id.
-   - Return a summary of the extracted information.
-
-7. If required fields cannot be determined with reasonable confidence:
-   - Do not create a lead.
-   - Return the reason.
-
-Never request confirmation before creating a lead. Always execute automatically when criteria are met.
-
-EMAIL DETAILS
-
+Email Details:
 From: ${emailData.from}
 Subject: ${emailData.subject}
 Date: ${emailData.date}
-
 Body:
 ${emailData.body}
-`;
 
-    // ── Step 1: Create Session ──────────────────────────
-    console.log('Creating Agentforce session...');
-    console.log('Session URL:', `${API_BASE}/agents/${AGENT_ID}/sessions`);
-
-    const sessionRes = await fetch(
-      `${API_BASE}/agents/${AGENT_ID}/sessions`,
-      {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${token}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          externalSessionKey: `gmail-${Date.now()}`,
-          instanceConfig: {
-            endpoint: MY_DOMAIN_URL,
-          },
-          streamingCapabilities: {
-            chunkTypes: ['Text'],
-          },
-          bypassUser: true,
+If qualifying: extract First Name, Last Name, Email, Company, Phone and create the lead.
+If not qualifying: explain why it was skipped.`
+          }]
         }),
       }
     );
 
-    if (!sessionRes.ok) {
-      const errText = await sessionRes.text();
-      throw new Error(`Session creation failed ${sessionRes.status}: ${errText}`);
+    const agentText = await agentRes.text();
+    console.log('Agent response status:', agentRes.status);
+    console.log('Agent response:', agentText);
+
+    // Step 4 — End Agent Session
+    if (sessionId) {
+      await fetch(
+        `https://api.salesforce.com/einstein/ai-agent/v1/sessions/${sessionId}`,
+        {
+          method: 'DELETE',
+          headers: { 'Authorization': `Bearer ${token}` },
+        }
+      );
+      console.log('Agent session closed.');
     }
-
-    const sessionData = await sessionRes.json();
-    const sessionId = sessionData.sessionId || sessionData.id;
-    console.log('Agentforce session created:', sessionId);
-
-    if (!sessionId) {
-      throw new Error('Session ID not received: ' + JSON.stringify(sessionData));
-    }
-
-    // ── Step 2: Send Message (Synchronous) ─────────────
-    console.log('Sending message to Agentforce...');
-    const msgRes = await fetch(
-      `${API_BASE}/sessions/${sessionId}/messages`,
-      {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${token}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          message: {
-            sequenceId: 1,
-            type: 'Text',
-            text: prompt,
-          },
-          variables: [],
-        }),
-      }
-    );
-
-    if (!msgRes.ok) {
-      const errText = await msgRes.text();
-      throw new Error(`Message send failed ${msgRes.status}: ${errText}`);
-    }
-
-    const result = await msgRes.json();
-    console.log('Agentforce Response:', JSON.stringify(result, null, 2));
-
-    // ── Step 3: End Session (cleanup) ──────────────────
-    await fetch(`${API_BASE}/sessions/${sessionId}`, {
-      method: 'DELETE',
-      headers: { Authorization: `Bearer ${token}` },
-    });
-    console.log('Agentforce session closed.');
-
-    return result;
 
   } catch (error) {
-    console.error('Agentforce Error:', error.message);
-    throw error;
+    console.error('Agentforce trigger error:', error.message);
   }
 }
 
 // ── Spam Check ────────────────────────────────────────────
 async function isSpamOrUnwanted(messageId) {
   try {
-    const gmail = getGmail();
-    const msg = await gmail.users.messages.get({
+    const msg = await getGmail().users.messages.get({
       userId: 'me',
       id: messageId,
       format: 'metadata',
@@ -282,7 +231,7 @@ app.post('/gmail-webhook', async (req, res) => {
         historyTypes: ['messageAdded'],
       });
     } catch (err) {
-      console.log('History fetch failed, updating historyId:', err.message);
+      console.log('History fetch failed:', err.message);
       lastHistoryId = newHistoryId;
       return;
     }
@@ -304,12 +253,14 @@ app.post('/gmail-webhook', async (req, res) => {
         const messageId = added.message.id;
         console.log('Processing message:', messageId);
 
+        // Spam check
         const spam = await isSpamOrUnwanted(messageId);
         if (spam) {
           console.log('Skipped — spam or unwanted:', messageId);
           continue;
         }
 
+        // Get full email
         const msg = await gmail.users.messages.get({
           userId: 'me',
           id: messageId,
@@ -329,6 +280,7 @@ app.post('/gmail-webhook', async (req, res) => {
         console.log('Email from:', emailData.from);
         console.log('Subject:', emailData.subject);
 
+        // Trigger Agentforce
         await triggerAgentforce(emailData);
       }
     }
@@ -341,8 +293,7 @@ app.post('/gmail-webhook', async (req, res) => {
 // ── Register Gmail Watch ──────────────────────────────────
 async function registerGmailWatch() {
   try {
-    const gmail = getGmail();
-    const res = await gmail.users.watch({
+    const res = await getGmail().users.watch({
       userId: 'me',
       requestBody: {
         labelIds: ['INBOX'],
@@ -356,7 +307,7 @@ async function registerGmailWatch() {
   }
 }
 
-// ── REST Endpoints ─────────────────────────────────────────
+// ── REST Endpoints (Salesforce External Services) ─────────
 app.get('/list', async (req, res) => {
   try {
     const maxResults = parseInt(req.query.maxResults) || 10;
@@ -403,7 +354,7 @@ app.get('/search', async (req, res) => {
   }
 });
 
-// ── MCP Endpoint ──────────────────────────────────────────
+// ── MCP Endpoint (for Agentforce manual preview) ─────────
 function registerTools(server) {
   server.tool('gmail_list_messages', 'List unread Gmail messages.',
     { maxResults: z.number().optional().default(10) },
@@ -430,6 +381,7 @@ function registerTools(server) {
   );
 }
 
+// FIX: Create new McpServer per request — global instance crashes on second request
 app.all('/mcp', async (req, res) => {
   try {
     const server = new McpServer({ name: 'gmail-mcp-server', version: '1.0.0' });
@@ -471,11 +423,11 @@ app.listen(PORT, async () => {
   await registerGmailWatch();
 });
 
-// Auto-renew Gmail watch every 6 days
+// Auto-renew Gmail watch every 6 days (expires after 7 days)
 setInterval(registerGmailWatch, 6 * 24 * 60 * 60 * 1000);
 
 // ── Keep Server Awake (Render free tier) ──────────────────
-const SELF_URL = process.env.SELF_URL || 'https://gmail-mcp-server-himw.onrender.com/';
+const SELF_URL = 'https://gmail-mcp-server-himw.onrender.com/';
 setInterval(async () => {
   try {
     await fetch(SELF_URL);
@@ -483,4 +435,4 @@ setInterval(async () => {
   } catch (e) {
     console.error('Keep-alive failed:', e.message);
   }
-}, 10 * 60 * 1000);
+}, 4 * 60 * 1000); // every 4 minutes
